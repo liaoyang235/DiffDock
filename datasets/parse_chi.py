@@ -87,11 +87,21 @@ def get_dihedral_indices(onehot_sequence):
 
 
 def _get_chi_angles(coords, indices):
-    X = coords
-    Y = indices.astype(int)
-    N = coords.shape[0]
+    # X = coords
+    # Y = indices.astype(int)
+    # N = coords.shape[0]
+    # mask = np.isnan(indices)
+    # Y[mask] = 0
+    # Z = X[np.arange(N)[:, None, None], Y, :]
+    # Z[mask] = np.nan
+    # chi_angles = batch_compute_dihedral_angles(Z.reshape(-1, 4, 3)).reshape(N, 4)
+    # return chi_angles
     mask = np.isnan(indices)
-    Y[mask] = 0
+    indices_fixed = np.where(mask, 0, indices)
+    
+    X = coords
+    Y = indices_fixed.astype(int)
+    N = coords.shape[0]
     Z = X[np.arange(N)[:, None, None], Y, :]
     Z[mask] = np.nan
     chi_angles = batch_compute_dihedral_angles(Z.reshape(-1, 4, 3)).reshape(N, 4)

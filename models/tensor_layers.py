@@ -12,6 +12,7 @@ from e3nn.o3 import TensorProduct, Linear
 from torch_scatter import scatter, scatter_mean
 
 from models.layers import FCBlock
+from models.taskrouting import TaskRouter
 
 
 def get_irrep_seq(ns, nv, use_second_order_repr, reduce_pseudoscalars):
@@ -123,7 +124,7 @@ class FasterTensorProduct(torch.nn.Module):
 
 
 def tp_scatter_simple(tp, fc_layer, node_attr, edge_index, edge_attr, edge_sh,
-                      out_nodes=None, reduce='mean', edge_weight=1.0):
+                      out_nodes=None, reduce='mean', edge_weight=1.0,routers = None,ts=None,routing_residual=False):
     """
     Perform TensorProduct + scatter operation, aka graph convolution.
 
@@ -139,16 +140,40 @@ def tp_scatter_simple(tp, fc_layer, node_attr, edge_index, edge_attr, edge_sh,
     edge_src, edge_dst = edge_index
     out_irreps = fc_layer(edge_attr).to(_device).to(_dtype)
     out_irreps.mul_(edge_weight)
-    tp = tp(node_attr[edge_dst], edge_sh, out_irreps)
+
+    if ts is None:
+        summand = tp(node_attr[edge_dst], edge_sh, out_irreps)
+    else:
+        all_mask = torch.zeros(node_attr.shape,device = node_attr.device,dtype = edge_sh.dtype)
+        node_sh = node_attr[edge_dst]
+        last_unit = 0
+        tss = ts[edge_dst].to(node_sh.device)
+        for i in range(len(routers)):
+            routers[i].set_active_task((tss*routers[i].task_count).floor())
+            masks = routers[i].active_mask.squeeze(1)
+            all_mask[:,last_unit:last_unit+masks.shape[1]] = masks
+            last_unit += masks.shape[1]
+        routed_sh = torch.mul(node_sh,all_mask)
+        if routing_residual:
+            residual_sh = node_sh - routed_sh
+            routed_summand = tp(routed_sh, edge_sh, out_irreps)
+            dummy_edge = torch.ones(edge_sh.shape, device=_device, dtype=_dtype)
+            dummy_cur_out_irreps = torch.ones(out_irreps.shape, device=_device, dtype=_dtype)
+            residual_summand = tp(residual_sh, dummy_edge, dummy_cur_out_irreps)
+            summand = routed_summand + residual_summand
+        else:
+            routed_summand = tp(routed_sh, edge_sh, out_irreps)
+            summand = routed_summand
+
     out_nodes = out_nodes or node_attr.shape[0]
-    out = scatter(tp, edge_src, dim=0, dim_size=out_nodes, reduce=reduce)
+    out = scatter(summand, edge_src, dim=0, dim_size=out_nodes, reduce=reduce)
     return out
 
 
 def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.ModuleList],
                           node_attr: torch.Tensor, edge_index: torch.Tensor,
                           edge_attr_groups: List[torch.Tensor], edge_sh: torch.Tensor,
-                          out_nodes=None, reduce='mean', edge_weight=1.0):
+                          out_nodes=None, reduce='mean', edge_weight=1.0,routers = None,ts=None,routing_residual=False):
     """
     Perform TensorProduct + scatter operation, aka graph convolution.
 
@@ -201,6 +226,8 @@ def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.Mo
     div_factors = torch.zeros(out_nodes, device=_device, dtype=_dtype)
 
     cur_start = 0
+
+    # 对每一种edge使用对应的FCBlock
     for ii in range(num_edge_groups):
         cur_length = edge_attr_lengths[ii]
         cur_end = cur_start + cur_length
@@ -208,13 +235,40 @@ def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.Mo
         cur_edge_src, cur_edge_dst = edge_src[cur_edge_range], edge_dst[cur_edge_range]
 
         cur_fc = fc_layer[ii] if isinstance(fc_layer, nn.ModuleList) else fc_layer
+
         cur_out_irreps = cur_fc(edge_attr_groups[ii])
         if edge_weight_is_indexable:
             cur_out_irreps.mul_(edge_weight[cur_edge_range])
         else:
             cur_out_irreps.mul_(edge_weight)
-
-        summand = tp(node_attr[cur_edge_dst, :], edge_sh[cur_edge_range, :], cur_out_irreps)
+        
+        if ts is None:
+            summand = tp(node_attr[cur_edge_dst, :], edge_sh[cur_edge_range, :], cur_out_irreps)
+        else:
+            sh = node_attr[cur_edge_dst, :]
+            tss = ts[cur_edge_dst].to(sh.device)
+            all_mask = torch.zeros(sh.shape,device = sh.device,dtype = sh.dtype) # torch.zeros_like
+            last_unit = 0
+            for i in range(len(routers)): # TODO cat masks and multiply once
+                tasks = (tss*routers[i].task_count).floor()
+                tasks = torch.min(tasks, torch.tensor(routers[i].task_count - 1, device=tasks.device))
+                routers[i].set_active_task(tasks)
+                masks = routers[i].active_mask.squeeze(1)
+                all_mask[:,last_unit:last_unit+masks.shape[1]] = masks
+                last_unit += masks.shape[1]
+            routed_sh = torch.mul(sh,all_mask)
+            # TODO remove residual_sh
+            if routing_residual:
+                residual_sh = sh - routed_sh
+                routed_summand = tp(routed_sh, edge_sh[cur_edge_range, :], cur_out_irreps)
+                dummy_edge = torch.ones(edge_sh[cur_edge_range, :].shape, device=_device, dtype=_dtype)
+                dummy_cur_out_irreps = torch.ones(cur_out_irreps.shape, device=_device, dtype=_dtype)
+                residual_summand = tp(residual_sh, dummy_edge, dummy_cur_out_irreps)
+                summand = routed_summand + residual_summand
+            else:
+                routed_summand = tp(routed_sh, edge_sh[cur_edge_range, :], cur_out_irreps)
+                summand = routed_summand
+                
         # We take a simple sum, and then add up the count of edges which contribute,
         # so that we can take the mean later.
         final_out += scatter(summand, cur_edge_src, dim=0, dim_size=out_nodes, reduce="sum")
@@ -233,7 +287,7 @@ def tp_scatter_multigroup(tp: o3.TensorProduct, fc_layer: Union[nn.Module, nn.Mo
 
 class TensorProductConvLayer(torch.nn.Module):
     def __init__(self, in_irreps, sh_irreps, out_irreps, n_edge_features, residual=True, batch_norm=True, dropout=0.0,
-                 hidden_features=None, faster=False, edge_groups=1, tp_weights_layers=2, activation='relu', depthwise=False):
+                 hidden_features=None, faster=False, edge_groups=1, tp_weights_layers=2, activation='relu', depthwise=False,routing = False,T=1000,routing_beta=0.8,routing_residual=False,routing_alpha=4):
         super(TensorProductConvLayer, self).__init__()
         self.in_irreps = in_irreps
         self.out_irreps = out_irreps
@@ -242,6 +296,15 @@ class TensorProductConvLayer(torch.nn.Module):
         self.edge_groups = edge_groups
         self.out_size = irrep_to_size(out_irreps)
         self.depthwise = depthwise
+        self.routers = []
+        if routing:
+            irreps = in_irreps.split('+')
+            for i in irreps:
+                i = i.replace(" ", "")
+                size = irrep_to_size(i)
+                self.routers.append(TaskRouter(size, T, routing_beta, 'DTR', routing_alpha))
+        self.routing_residual = routing_residual
+
         if hidden_features is None:
             hidden_features = n_edge_features
 
@@ -306,7 +369,7 @@ class TensorProductConvLayer(torch.nn.Module):
 
         self.batch_norm = BatchNorm(out_irreps) if batch_norm else None
 
-    def forward(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, reduce='mean', edge_weight=1.0):
+    def forward(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, reduce='mean', edge_weight=1.0,ts=None):
         if edge_index.shape[1] == 0 and node_attr.shape[0] == 0:
             raise ValueError("No edges and no nodes")
 
@@ -316,10 +379,10 @@ class TensorProductConvLayer(torch.nn.Module):
         else:
             if self.edge_groups == 1:
                 out = tp_scatter_simple(self.tp, self.fc, node_attr, edge_index, edge_attr, edge_sh,
-                                        out_nodes, reduce, edge_weight)
+                                        out_nodes, reduce, edge_weight,self.routers,ts,self.routing_residual)
             else:
                 out = tp_scatter_multigroup(self.tp, self.fc, node_attr, edge_index, edge_attr, edge_sh,
-                                            out_nodes, reduce, edge_weight)
+                                            out_nodes, reduce, edge_weight,self.routers,ts,self.routing_residual)
 
             if self.depthwise:
                 out = self.linear_2(out)

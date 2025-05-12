@@ -112,7 +112,7 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
 
                 set_time(mod_complex_graph_batch, t_schedule[t_idx] if t_schedule is not None else None, t_tr, t_rot, t_tor, b,
                          'all_atoms' in model_args and model_args.all_atoms, device)
-
+                
                 tr_score, rot_score, tor_score = model(mod_complex_graph_batch)[:3]
                 mean_scores = torch.mean(tr_score, dim=-1)
                 num_nans = torch.sum(torch.isnan(mean_scores))

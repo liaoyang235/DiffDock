@@ -103,6 +103,7 @@ class NoiseTransform(BaseTransform):
         data.tr_score = -tr_update / tr_sigma ** 2
         data.rot_score = torch.from_numpy(so3.score_vec(vec=rot_update, eps=rot_sigma)).float().unsqueeze(0)
         data.tor_score = None if self.no_torsion else torch.from_numpy(torus.score(torsion_updates, tor_sigma)).float()
+        data.t = t
         data.tor_sigma_edge = None if self.no_torsion else np.ones(data['ligand'].edge_mask.sum()) * tor_sigma
 
         if data['ligand'].pos.shape[0] == 1:
@@ -447,7 +448,10 @@ def print_statistics(complex_graphs):
     print('Number of complexes: ', len(complex_graphs))
     for i in range(len(name)):
         array = np.asarray(statistics[i])
-        print(f"{name[i]}: mean {np.mean(array)}, std {np.std(array)}, max {np.max(array)}")
+        try:
+            print(f"{name[i]}: mean {np.mean(array)}, std {np.std(array)}, max {np.max(array)}")
+        except:
+            print(f"Not available")
 
     return
 

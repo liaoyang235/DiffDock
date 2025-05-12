@@ -155,6 +155,7 @@ def set_time(complex_graphs, t, t_tr, t_rot, t_tor, batchsize, all_atoms, device
     complex_graphs.complex_t = {'tr': t_tr * torch.ones(batchsize).to(device),
                                'rot': t_rot * torch.ones(batchsize).to(device),
                                'tor': t_tor * torch.ones(batchsize).to(device)}
+    complex_graphs.t = t_tr * torch.ones(batchsize).to(device)
     if all_atoms:
         complex_graphs['atom'].node_t = {
             'tr': t_tr * torch.ones(complex_graphs['atom'].num_nodes).to(device),

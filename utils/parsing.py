@@ -3,8 +3,18 @@ from argparse import ArgumentParser,FileType
 
 def parse_train_args():
 
+
+
     # General arguments
     parser = ArgumentParser()
+
+    parser.add_argument('--routing', action='store_true', default=False, help='Whether to use routing')
+    parser.add_argument('--descretization_step', type=int, default=1000, help='Number of discretization steps')
+    parser.add_argument('--routing_beta', type=float, default=0.8, help='Beta parameter of the routing')
+    parser.add_argument('--routing_residual', action='store_true', default=False, help='Whether to use residual connections in routing')
+    parser.add_argument('--debug_batch', type=int, default=0, help='Number of batches to run in debug mode')
+    parser.add_argument('--routing_alpha', type=float, default=4, help='Alpha parameter of the routing')
+
     parser.add_argument('--config', type=FileType(mode='r'), default=None)
     parser.add_argument('--log_dir', type=str, default='workdir/test_score', help='Folder in which to save model and logs')
     parser.add_argument('--restart_dir', type=str, help='Folder of previous training model from which to restart')
@@ -85,7 +95,7 @@ def parse_train_args():
     parser.add_argument('--triple_training', action='store_true', default=False, help='')
     parser.add_argument('--crop_beyond', type=float, default=20, help='')
 
-    # Diffusion
+    # Diffusiontr_update
     parser.add_argument('--tr_weight', type=float, default=0.33, help='Weight of translation loss')
     parser.add_argument('--rot_weight', type=float, default=0.33, help='Weight of rotation loss')
     parser.add_argument('--tor_weight', type=float, default=0.33, help='Weight of torsional loss')

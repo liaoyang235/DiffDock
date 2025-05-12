@@ -273,7 +273,12 @@ def get_model(args, device, t_to_sigma, no_parallel=False, confidence_mode=False
                             atom_confidence=args.atom_confidence_loss_weight > 0.0 if "atom_confidence_loss_weight" in args else False,
                             sidechain_pred=(hasattr(args, 'sidechain_loss_weight') and args.sidechain_loss_weight > 0) or
                                            (hasattr(args, 'backbone_loss_weight') and args.backbone_loss_weight > 0),
-                            depthwise_convolution=args.depthwise_convolution if hasattr(args, 'depthwise_convolution') else False)
+                            depthwise_convolution=args.depthwise_convolution if hasattr(args, 'depthwise_convolution') else False,
+                            routing = args.routing,
+                            T = args.descretization_step,
+                            routing_beta = args.routing_beta,
+                            routing_residual = args.routing_residual,
+                            routing_alpha= args.routing_alpha)
 
     if device.type == 'cuda' and not no_parallel and ('dataset' not in args or not args.dataset == 'torsional'):
         model = DataParallel(model)

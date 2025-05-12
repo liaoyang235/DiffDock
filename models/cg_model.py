@@ -15,6 +15,9 @@ from models.tensor_layers import TensorProductConvLayer, get_irrep_seq
 from utils import so3, torus
 from datasets.process_mols import lig_feature_dims, rec_residue_feature_dims, rec_atom_feature_dims
 
+import time
+from tqdm import tqdm
+
 
 class CGModel(torch.nn.Module):
     def __init__(self, t_to_sigma, device, timestep_emb_func, in_lig_edge_features=4, sigma_embed_dim=32, sh_lmax=2,
@@ -28,7 +31,8 @@ class CGModel(torch.nn.Module):
                  parallel_aggregators="mean max min std", num_confidence_outputs=1, atom_num_confidence_outputs=1, fixed_center_conv=False,
                  no_aminoacid_identities=False, include_miscellaneous_atoms=False,
                  differentiate_convolutions=True, tp_weights_layers=2, num_prot_emb_layers=0, reduce_pseudoscalars=False,
-                 embed_also_ligand=False, atom_confidence=False, sidechain_pred=False, depthwise_convolution=False):
+                 embed_also_ligand=False, atom_confidence=False, sidechain_pred=False, depthwise_convolution=False,t_max=-1,
+                 routing = False,T=1000,routing_beta=0.8,routing_residual=False,routing_alpha=4):
         super(CGModel, self).__init__()
         assert parallel == 1, "not implemented"
         assert (not no_aminoacid_identities) or (lm_embedding_type is None), "no language model emb without identities"
@@ -44,6 +48,8 @@ class CGModel(torch.nn.Module):
         self.center_max_distance = center_max_distance
         self.distance_embed_dim = distance_embed_dim
         self.cross_distance_embed_dim = cross_distance_embed_dim
+
+        # 指定使用2阶球谐函数，edge的向量特征会转换到该空间
         self.sh_irreps = o3.Irreps.spherical_harmonics(lmax=sh_lmax)
         self.ns, self.nv = ns, nv
         self.scale_by_sigma = scale_by_sigma
@@ -66,6 +72,11 @@ class CGModel(torch.nn.Module):
         self.atom_confidence = atom_confidence
         self.atom_num_confidence_outputs = atom_num_confidence_outputs
         self.sidechain_pred = sidechain_pred
+        self.routing = routing
+        self.T = T
+        self.routing_beta = routing_beta
+        self.routing_residual = routing_residual
+        self.routing_alpha = routing_alpha
 
         self.lm_embedding_type = lm_embedding_type
         if lm_embedding_type is None:
@@ -165,7 +176,12 @@ class CGModel(torch.nn.Module):
                 faster=sh_lmax == 1 and not use_second_order_repr,
                 tp_weights_layers=tp_weights_layers,
                 edge_groups=1 if not differentiate_convolutions else (2 if i == num_prot_emb_layers + num_conv_layers - 1 else 4),
-                depthwise=depthwise_convolution
+                depthwise=depthwise_convolution,
+                routing = self.routing,
+                T = self.T,
+                routing_beta = self.routing_beta,
+                routing_residual = self.routing_residual,
+                routing_alpha= self.routing_alpha
             )
             conv_layers.append(layer)
         self.conv_layers = nn.ModuleList(conv_layers)
@@ -256,7 +272,7 @@ class CGModel(torch.nn.Module):
 
     def ligand_embedding(self, data):
         # ligand embedding
-        lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight = self.build_lig_conv_graph(data)
+        lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight, lig_node_ts, lig_edge_ts = self.build_lig_conv_graph(data)
         lig_node_attr = self.lig_node_embedding(lig_node_attr)
         lig_edge_attr = self.lig_edge_embedding(lig_edge_attr)
 
@@ -267,10 +283,11 @@ class CGModel(torch.nn.Module):
             lig_node_attr = self.lig_emb_layers[l](lig_node_attr, lig_edge_index, edge_attr_, lig_edge_sh,
                                                    edge_weight=lig_edge_weight)
 
-        return lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight
+        return lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight, lig_node_ts, lig_edge_ts
 
     def embedding(self, data):
         if not hasattr(data['receptor'], "rec_node_attr"):
+            start_time = time.time()
             if self.lm_embedding_type not in [None, 'precomputed']:
                 sequences = [s for l in data['receptor'].sequence for s in l]
                 if isinstance(sequences[0], list):
@@ -280,14 +297,22 @@ class CGModel(torch.nn.Module):
                 out = self.lm(batch_tokens.to(data['receptor'].x.device), repr_layers=[self.lm.num_layers], return_contacts=False)
                 rec_lm_emb = torch.cat([t[:len(sequences[i][1])] for i, t in enumerate(out['representations'][self.lm.num_layers])], dim=0)
                 data['receptor'].x = torch.cat([data['receptor'].x, rec_lm_emb], dim=-1)
+                tqdm.write(f"         LM embedding time: {time.time() - start_time}")
+                start_time = time.time()
 
-            rec_node_attr, rec_edge_attr, rec_edge_sh, rec_edge_weight = self.build_rec_conv_graph(data)
+            rec_node_attr, rec_edge_attr, rec_edge_sh, rec_edge_weight, rec_node_ts, rec_edge_ts = self.build_rec_conv_graph(data)
             rec_node_attr = self.rec_node_embedding(rec_node_attr)
             rec_edge_attr = self.rec_edge_embedding(rec_edge_attr)
+
+            # tqdm.write(f"         Rec graph building time: {time.time() - start_time}")
+            start_time = time.time()
 
             for l in range(len(self.rec_emb_layers)):
                 edge_attr_ = torch.cat([rec_edge_attr, rec_node_attr[data['receptor', 'receptor'].edge_index[0], :self.ns], rec_node_attr[data['receptor', 'receptor'].edge_index[1], :self.ns]], -1)
                 rec_node_attr = self.rec_emb_layers[l](rec_node_attr, data['receptor', 'receptor'].edge_index, edge_attr_, rec_edge_sh, edge_weight=rec_edge_weight)
+            
+            
+            start_time = time.time()
 
             data['receptor'].rec_node_attr = rec_node_attr
             data['receptor', 'receptor'].rec_edge_attr = rec_edge_attr
@@ -300,10 +325,16 @@ class CGModel(torch.nn.Module):
         rec_node_attr[:, :self.ns] = rec_node_attr[:, :self.ns] + rec_sigma_emb[data['receptor'].batch]
         rec_edge_attr = data['receptor', 'receptor'].rec_edge_attr + rec_sigma_emb[data['receptor'].batch[data['receptor', 'receptor'].edge_index[0]]]
 
-        lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight = self.ligand_embedding(data)
+        # tqdm.write(f"         Rec embedding time: {time.time() - start_time}")
+        start_time = time.time()
+
+        lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight, lig_node_ts, lig_edge_ts = self.ligand_embedding(data)
+
+        # tqdm.write(f"         Lig embedding time: {time.time() - start_time}")
 
         return lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight, \
-               rec_node_attr, data['receptor', 'receptor'].edge_index, rec_edge_attr, data['receptor', 'receptor'].edge_sh, data['receptor', 'receptor'].edge_weight
+               rec_node_attr, data['receptor', 'receptor'].edge_index, rec_edge_attr, data['receptor', 'receptor'].edge_sh, data['receptor', 'receptor'].edge_weight, \
+                lig_node_ts, lig_edge_ts, rec_node_ts, rec_edge_ts
 
     def forward(self, data):
         if self.no_aminoacid_identities:
@@ -314,19 +345,30 @@ class CGModel(torch.nn.Module):
         else:
             tr_sigma, rot_sigma, tor_sigma = [data.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']]
 
+        start_time = time.time()
         lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh, lig_edge_weight, rec_node_attr, \
-            rec_edge_index, rec_edge_attr, rec_edge_sh, rec_edge_weight = self.embedding(data)
-
+            rec_edge_index, rec_edge_attr, rec_edge_sh, rec_edge_weight, \
+                 lig_node_ts, lig_edge_ts, rec_node_ts, rec_edge_ts = self.embedding(data)
+        # tqdm.write(f"     Embedding time: {time.time() - start_time}")
+        start_time = time.time()
         # build cross graph
         if self.dynamic_max_cross:
             cross_cutoff = (tr_sigma * 3 + 20).unsqueeze(1)
         else:
             cross_cutoff = self.cross_max_distance
 
-        lr_edge_index, lr_edge_attr, lr_edge_sh, rev_lr_edge_sh, lr_edge_weight = self.build_cross_conv_graph(data, cross_cutoff)
+        start_time2 = time.time()
+        lr_edge_index, lr_edge_attr, lr_edge_sh, rev_lr_edge_sh, lr_edge_weight, lr_edge_ts = self.build_cross_conv_graph(data, cross_cutoff)
         lr_edge_attr = self.cross_edge_embedding(lr_edge_attr)
+        # tqdm.write(f"         Cross graph building time: {time.time() - start_time2}")
+        start_time2 = time.time()
 
         node_attr = torch.cat([lig_node_attr, rec_node_attr], dim=0)
+        if self.routing:
+            node_ts = torch.cat([lig_node_ts, rec_node_ts], dim=0).to(node_attr.device)
+        else:
+            node_ts = None
+
         lr_edge_index[1] = lr_edge_index[1] + len(lig_node_attr)
         edge_index = torch.cat([lig_edge_index, lr_edge_index, rec_edge_index + len(lig_node_attr),
                                 torch.flip(lr_edge_index, dims=[0])], dim=1)
@@ -335,20 +377,31 @@ class CGModel(torch.nn.Module):
         edge_weight = torch.cat([lig_edge_weight, lr_edge_weight, rec_edge_weight, lr_edge_weight],
                                 dim=0) if torch.is_tensor(lig_edge_weight) else torch.ones((len(edge_index[0]), 1),
                                                                                            device=edge_index.device)
+        if self.routing:
+            edge_ts = torch.cat([lig_edge_ts, lr_edge_ts, rec_edge_ts, lr_edge_ts], dim=0).to(node_attr.device)
+        else:
+            edge_ts = None
+        # tqdm.write(f"         Cat time: {time.time() - start_time2}")
+
         s1, s2, s3 = len(lig_edge_index[0]), len(lig_edge_index[0]) + len(lr_edge_index[0]), len(lig_edge_index[0]) + len(lr_edge_index[0]) + len(rec_edge_index[0])
+        # tqdm.write(f"     Graph building time: {time.time() - start_time}")
+        start_time = time.time()
 
         for l in range(len(self.conv_layers)):
             if l < len(self.conv_layers) - 1:
                 edge_attr_ = torch.cat(
                     [edge_attr, node_attr[edge_index[0], :self.ns], node_attr[edge_index[1], :self.ns]], -1)
                 if self.differentiate_convolutions: edge_attr_ = [edge_attr_[:s1], edge_attr_[s1:s2], edge_attr_[s2:s3], edge_attr_[s3:]]
-                node_attr = self.conv_layers[l](node_attr, edge_index, edge_attr_, edge_sh, edge_weight=edge_weight)
+                node_attr = self.conv_layers[l](node_attr, edge_index, edge_attr_, edge_sh, edge_weight=edge_weight,ts = node_ts)
             else:
                 edge_attr_ = torch.cat([edge_attr[:s2], node_attr[edge_index[0, :s2], :self.ns], node_attr[edge_index[1, :s2], :self.ns]], -1)
                 if self.differentiate_convolutions: edge_attr_ = [edge_attr_[:s1], edge_attr_[s1:s2]]
-                node_attr = self.conv_layers[l](node_attr, edge_index[:, :s2], edge_attr_, edge_sh[:s2], edge_weight=edge_weight[:s2])
+                node_attr = self.conv_layers[l](node_attr, edge_index[:, :s2], edge_attr_, edge_sh[:s2], edge_weight=edge_weight[:s2],ts = node_ts)
 
         lig_node_attr = node_attr[:len(lig_node_attr)]
+
+        # tqdm.write(f"     Convolution time: {time.time() - start_time}")
+        start_time = time.time()
 
         # compute confidence score
         if self.confidence_mode:
@@ -421,6 +474,9 @@ class CGModel(torch.nn.Module):
         if self.scale_by_sigma:
             tor_pred = tor_pred * torch.sqrt(torch.tensor(torus.score_norm(edge_sigma.cpu().numpy())).float()
                                              .to(data['ligand'].x.device))
+
+        # tqdm.write(f"     Final predict time: {time.time() - start_time}")    
+        
         return tr_pred, rot_pred, tor_pred, sidechain_pred
 
     def torsional_forward(self, data):
@@ -466,6 +522,15 @@ class CGModel(torch.nn.Module):
 
     def build_lig_conv_graph(self, data):
         # builds the ligand graph edges and initial node and edge features
+
+        # node_ts = []
+        # edge_ts = []
+        # for n in data['ligand'].batch:
+        #     node_ts.append(data.t[n])
+        
+        # node_ts = torch.Tensor(node_ts)
+        node_ts = data.t[data['ligand'].batch]
+
         if self.separate_noise_schedule:
             data['ligand'].node_sigma_emb = torch.cat([self.timestep_emb_func(data['ligand'].node_t[noise_type]) for noise_type in ['tr','rot','tor']], dim=1)
         elif self.asyncronous_noise_schedule:
@@ -481,6 +546,12 @@ class CGModel(torch.nn.Module):
             torch.zeros(radius_edges.shape[-1], self.in_lig_edge_features, device=data['ligand'].x.device)
         ], 0)
 
+        # for i in range(len(edge_index[0])):
+        #     edge_ts.append(data.t[data['ligand'].batch[edge_index[0,i]]])
+        
+        # edge_ts = torch.Tensor(edge_ts)
+        edge_ts = data.t[data['ligand'].batch[edge_index[0]]]
+
         # compute initial features
         edge_sigma_emb = data['ligand'].node_sigma_emb[edge_index[0].long()]
         edge_attr = torch.cat([edge_attr, edge_sigma_emb], 1)
@@ -494,9 +565,23 @@ class CGModel(torch.nn.Module):
         edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
         edge_weight = self.get_edge_weight(edge_vec, self.lig_max_radius)
 
-        return node_attr, edge_index, edge_attr, edge_sh, edge_weight
+        return node_attr, edge_index, edge_attr, edge_sh, edge_weight, node_ts, edge_ts
 
     def build_rec_conv_graph(self, data):
+        # node_ts = []
+        # edge_ts = []
+        # for n in data['receptor'].batch:
+        #     node_ts.append(data.t[n])
+        
+        # node_ts = torch.Tensor(node_ts)
+        
+        # for i in range(data['receptor','receptor'].edge_index.shape[1]):
+        #     edge_ts.append(data.t[data['receptor'].batch[data['receptor','receptor'].edge_index[0,i]]])
+
+        # edge_ts = torch.Tensor(edge_ts)
+        node_ts = data.t[data['receptor'].batch]
+        edge_ts = data.t[data['receptor'].batch[data['receptor','receptor'].edge_index[0]]]
+
         # builds the receptor initial node and edge embeddings
         assert not self.separate_noise_schedule or self.asyncronous_noise_schedule, "removed support in this function"
         node_attr = data['receptor'].x
@@ -511,7 +596,7 @@ class CGModel(torch.nn.Module):
         edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
         edge_weight = self.get_edge_weight(edge_vec, self.rec_max_radius)
 
-        return node_attr, edge_attr, edge_sh, edge_weight
+        return node_attr, edge_attr, edge_sh, edge_weight, node_ts, edge_ts
 
     def build_misc_atom_conv_graph(self, data):
         # build the graph between receptor misc_atoms
@@ -537,6 +622,8 @@ class CGModel(torch.nn.Module):
         return node_attr, edge_index, edge_attr, edge_sh, edge_weight
 
     def build_cross_conv_graph(self, data, cross_distance_cutoff):
+
+        start_time = time.time()
         # builds the cross edges between ligand and receptor
         if torch.is_tensor(cross_distance_cutoff):
             # different cutoff for every graph (depends on the diffusion time)
@@ -548,18 +635,33 @@ class CGModel(torch.nn.Module):
                             data['receptor'].batch, data['ligand'].batch, max_num_neighbors=10000)
 
         src, dst = edge_index
+        # tqdm.write(f"             Radius time: {time.time() - start_time}")
+        start_time = time.time()
+
+        # for i in range(len(edge_index[0])):
+        #     edge_ts.append(data.t[data['ligand'].batch[edge_index[0,i]]])
+        # edge_ts = torch.Tensor(edge_ts)
+        edge_ts = data.t[data['ligand'].batch[src]]
+
+        # tqdm.write(f"             Edge ts time: {time.time() - start_time}")
+        start_time = time.time()
+
         edge_vec = data['receptor'].pos[dst.long()] - data['ligand'].pos[src.long()]
 
         edge_length_emb = self.cross_distance_expansion(edge_vec.norm(dim=-1))
         edge_sigma_emb = data['ligand'].node_sigma_emb[src.long()]
         edge_attr = torch.cat([edge_sigma_emb, edge_length_emb], 1)
         edge_sh = o3.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+
+        # rev = reverse
         rev_edge_sh = o3.spherical_harmonics(self.sh_irreps, -edge_vec, normalize=True, normalization='component')
 
         cutoff_d = cross_distance_cutoff[data['ligand'].batch[src]].squeeze() if torch.is_tensor(cross_distance_cutoff) else cross_distance_cutoff
         edge_weight = self.get_edge_weight(edge_vec, cutoff_d)
 
-        return edge_index, edge_attr, edge_sh, rev_edge_sh, edge_weight
+        # tqdm.write(f"             Edge process time: {time.time() - start_time}")
+
+        return edge_index, edge_attr, edge_sh, rev_edge_sh, edge_weight, edge_ts
 
     def build_misc_cross_conv_graph(self, data, lr_cross_distance_cutoff):
         # build the cross edges between ligan atoms, receptor residues and receptor atoms

@@ -57,7 +57,7 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
                                                                optimizer=optimizer)
 
         logs = {}
-        train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights if epoch > freeze_params else None)
+        train_losses = train_epoch(model, train_loader, optimizer, device, t_to_sigma, loss_fn, ema_weights if epoch > freeze_params else None, debug_batch = args.debug_batch)
         print("Epoch {}: Training loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}  lr {:.4f}"
               .format(epoch, train_losses['loss'], train_losses['tr_loss'], train_losses['rot_loss'],
                       train_losses['tor_loss'], train_losses['sidechain_loss'], optimizer.param_groups[0]['lr']))
@@ -65,42 +65,51 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
         if epoch > freeze_params:
             ema_weights.store(model.parameters())
             if args.use_ema: ema_weights.copy_to(model.parameters()) # load ema parameters into model for running validation and inference
-        val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
-        print("Epoch {}: Validation loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}"
-              .format(epoch, val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['sidechain_loss']))
 
-        if args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
-            inf_dataset = [val_loader.dataset.get(i) for i in range(min(args.num_inference_complexes, val_loader.dataset.__len__()))]
-            inf_metrics = inference_epoch_fix(model, inf_dataset, device, t_to_sigma, args)
-            print("Epoch {}: Val inference rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
-                  .format(epoch, inf_metrics['rmsds_lt2'], inf_metrics['rmsds_lt5'], inf_metrics['min_rmsds_lt2'], inf_metrics['min_rmsds_lt5']))
-            logs.update({'valinf_' + k: v for k, v in inf_metrics.items()}, step=epoch + 1)
+        if args.debug_batch == 0 :
+            val_losses = test_epoch(model, val_loader, device, t_to_sigma, loss_fn, args.test_sigma_intervals)
+            print("Epoch {}: Validation loss {:.4f}  tr {:.4f}   rot {:.4f}   tor {:.4f}   sc {:.4f}"
+                .format(epoch, val_losses['loss'], val_losses['tr_loss'], val_losses['rot_loss'], val_losses['tor_loss'], val_losses['sidechain_loss']))
 
-        if args.double_val and args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
-            inf_dataset = [val_dataset2.get(i) for i in range(min(args.num_inference_complexes, val_dataset2.__len__()))]
-            inf_metrics2 = inference_epoch_fix(model, inf_dataset, device, t_to_sigma, args)
-            print("Epoch {}: Val inference on second validation rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
-                  .format(epoch, inf_metrics2['rmsds_lt2'], inf_metrics2['rmsds_lt5'], inf_metrics2['min_rmsds_lt2'], inf_metrics2['min_rmsds_lt5']))
-            logs.update({'valinf2_' + k: v for k, v in inf_metrics2.items()}, step=epoch + 1)
-            logs.update({'valinfcomb_' + k: (v + inf_metrics[k])/2 for k, v in inf_metrics2.items()}, step=epoch + 1)
+            if args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
+                inf_dataset = [val_loader.dataset.get(i) for i in range(min(args.num_inference_complexes, val_loader.dataset.__len__()))]
+                inf_metrics = inference_epoch_fix(model, inf_dataset, device, t_to_sigma, args)
+                print("Epoch {}: Val inference rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
+                    .format(epoch, inf_metrics['rmsds_lt2'], inf_metrics['rmsds_lt5'], inf_metrics['min_rmsds_lt2'], inf_metrics['min_rmsds_lt5']))
+                logs.update({'valinf_' + k: v for k, v in inf_metrics.items()}, step=epoch + 1)
 
-        if args.train_inference_freq != None and (epoch + 1) % args.train_inference_freq == 0:
-            inf_dataset = [train_loader.dataset.get(i) for i in range(min(min(args.num_inference_complexes, 300), train_loader.dataset.__len__()))]
-            inf_metrics = inference_epoch_fix(model, inf_dataset, device, t_to_sigma, args)
-            print("Epoch {}: Train inference rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
-                  .format(epoch, inf_metrics['rmsds_lt2'], inf_metrics['rmsds_lt5'], inf_metrics['min_rmsds_lt2'], inf_metrics['min_rmsds_lt5']))
-            logs.update({'traininf_' + k: v for k, v in inf_metrics.items()}, step=epoch + 1)
+            if args.double_val and args.val_inference_freq != None and (epoch + 1) % args.val_inference_freq == 0:
+                inf_dataset = [val_dataset2.get(i) for i in range(min(args.num_inference_complexes, val_dataset2.__len__()))]
+                inf_metrics2 = inference_epoch_fix(model, inf_dataset, device, t_to_sigma, args)
+                print("Epoch {}: Val inference on second validation rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
+                    .format(epoch, inf_metrics2['rmsds_lt2'], inf_metrics2['rmsds_lt5'], inf_metrics2['min_rmsds_lt2'], inf_metrics2['min_rmsds_lt5']))
+                logs.update({'valinf2_' + k: v for k, v in inf_metrics2.items()}, step=epoch + 1)
+                logs.update({'valinfcomb_' + k: (v + inf_metrics[k])/2 for k, v in inf_metrics2.items()}, step=epoch + 1)
 
-        if epoch > freeze_params:
-            if not args.use_ema: ema_weights.copy_to(model.parameters())
-            ema_state_dict = copy.deepcopy(model.module.state_dict() if device.type == 'cuda' else model.state_dict())
-            ema_weights.restore(model.parameters())
+            if args.train_inference_freq != None and (epoch + 1) % args.train_inference_freq == 0:
+                inf_dataset = [train_loader.dataset.get(i) for i in range(min(min(args.num_inference_complexes, 300), train_loader.dataset.__len__()))]
+                inf_metrics = inference_epoch_fix(model, inf_dataset, device, t_to_sigma, args)
+                print("Epoch {}: Train inference rmsds_lt2 {:.3f} rmsds_lt5 {:.3f} min_rmsds_lt2 {:.3f} min_rmsds_lt5 {:.3f}"
+                    .format(epoch, inf_metrics['rmsds_lt2'], inf_metrics['rmsds_lt5'], inf_metrics['min_rmsds_lt2'], inf_metrics['min_rmsds_lt5']))
+                logs.update({'traininf_' + k: v for k, v in inf_metrics.items()}, step=epoch + 1)
 
-        if args.wandb:
-            logs.update({'train_' + k: v for k, v in train_losses.items()})
-            logs.update({'val_' + k: v for k, v in val_losses.items()})
-            logs['current_lr'] = optimizer.param_groups[0]['lr']
-            wandb.log(logs, step=epoch + 1)
+            if epoch > freeze_params:
+                if not args.use_ema: ema_weights.copy_to(model.parameters())
+                ema_state_dict = copy.deepcopy(model.module.state_dict() if device.type == 'cuda' else model.state_dict())
+                ema_weights.restore(model.parameters())
+
+            if args.wandb:
+                logs.update({'train_' + k: v for k, v in train_losses.items()})
+                logs.update({'val_' + k: v for k, v in val_losses.items()})
+                logs['current_lr'] = optimizer.param_groups[0]['lr']
+                wandb.log(logs, step=epoch + 1)
+
+        else:
+            if args.wandb:
+                logs.update({'train_' + k: v for k, v in train_losses.items()})
+                logs['current_lr'] = optimizer.param_groups[0]['lr']
+                wandb.log(logs, step=epoch + 1)
+
 
         state_dict = model.module.state_dict() if device.type == 'cuda' else model.state_dict()
         if args.inference_earlystop_metric in logs.keys() and \
@@ -119,34 +128,39 @@ def train(args, model, optimizer, scheduler, ema_weights, train_loader, val_load
             if epoch > freeze_params:
                 torch.save(ema_state_dict, os.path.join(run_dir, 'best_ema_secondary_epoch_model.pt'))
 
-        if val_losses['loss'] <= best_val_loss:
-            best_val_loss = val_losses['loss']
-            best_epoch = epoch
-            torch.save(state_dict, os.path.join(run_dir, 'best_model.pt'))
-            if epoch > freeze_params:
-                torch.save(ema_state_dict, os.path.join(run_dir, 'best_ema_model.pt'))
+            if val_losses['loss'] <= best_val_loss:
+                best_val_loss = val_losses['loss']
+                best_epoch = epoch
+                torch.save(state_dict, os.path.join(run_dir, 'best_model.pt'))
+                if epoch > freeze_params:
+                    torch.save(ema_state_dict, os.path.join(run_dir, 'best_ema_model.pt'))
 
-        if args.save_model_freq is not None and (epoch + 1) % args.save_model_freq == 0:
-            shutil.copyfile(os.path.join(run_dir, 'best_model.pt'),
-                            os.path.join(run_dir, f'epoch{epoch+1}_best_model.pt'))
+            if args.save_model_freq is not None and (epoch + 1) % args.save_model_freq == 0:
+                shutil.copyfile(os.path.join(run_dir, 'best_model.pt'),
+                                os.path.join(run_dir, f'epoch{epoch+1}_best_model.pt'))
 
-        if scheduler:
-            if epoch < freeze_params or (args.scheduler == 'linear_warmup' and epoch < args.warmup_dur):
-                scheduler.step()
-            elif args.val_inference_freq is not None:
-                scheduler.step(best_val_inference_value)
-            else:
-                scheduler.step(val_losses['loss'])
+            if scheduler:
+                if epoch < freeze_params or (args.scheduler == 'linear_warmup' and epoch < args.warmup_dur):
+                    scheduler.step()
+                elif args.val_inference_freq is not None:
+                    scheduler.step(best_val_inference_value)
+                else:
+                    scheduler.step(val_losses['loss'])
+
+            
+            print("Best Validation Loss {} on Epoch {}".format(best_val_loss, best_epoch))
+            print("Best inference metric {} on Epoch {}".format(best_val_inference_value, best_val_inference_epoch))
 
         torch.save({
             'epoch': epoch,
             'model': state_dict,
             'optimizer': optimizer.state_dict(),
             'ema_weights': ema_weights.state_dict(),
-        }, os.path.join(run_dir, 'last_model.pt'))
+            }, os.path.join(run_dir, 'last_model.pt'))
+        
 
-    print("Best Validation Loss {} on Epoch {}".format(best_val_loss, best_epoch))
-    print("Best inference metric {} on Epoch {}".format(best_val_inference_value, best_val_inference_epoch))
+
+
 
 
 def main_function():

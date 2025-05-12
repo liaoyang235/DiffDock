@@ -10,6 +10,7 @@ from utils import so3, torus
 from utils.molecules_utils import get_symmetry_rmsd
 from utils.sampling import randomize_position, sampling
 from utils.diffusion_utils import get_t_schedule
+import time
 
 
 def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma, device, tr_weight=1, rot_weight=1,
@@ -17,13 +18,13 @@ def loss_function(tr_pred, rot_pred, tor_pred, sidechain_pred, data, t_to_sigma,
     tr_sigma, rot_sigma, tor_sigma = t_to_sigma(
         *[torch.cat([d.complex_t[noise_type] for d in data]) if device.type == 'cuda' else data.complex_t[noise_type]
           for noise_type in ['tr', 'rot', 'tor']])
-    mean_dims = (0, 1) if apply_mean else 1
+    mean_dims = (0, 1) if apply_mean else 1 # True
 
     # translation component
     tr_score = torch.cat([d.tr_score for d in data], dim=0) if device.type == 'cuda' else data.tr_score
     tr_sigma = tr_sigma.unsqueeze(-1)
     tr_loss = ((tr_pred.cpu() - tr_score.cpu()) ** 2 * tr_sigma.cpu() ** 2).mean(dim=mean_dims)
-    tr_base_loss = (tr_score ** 2 * tr_sigma ** 2).mean(dim=mean_dims).detach()
+    tr_base_loss = (tr_score ** 2 * tr_sigma ** 2).mean(dim=mean_dims).detach() # ( tr_update / tr_sigma ) ^ 2
 
     # rotation component
     rot_score = torch.cat([d.rot_score for d in data], dim=0) if device.type == 'cuda' else data.rot_score
@@ -156,20 +157,26 @@ class AverageMeter():
             return out
 
 
-def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights):
+def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weights, debug_batch = None):
     model.train()
     meter = AverageMeter(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'backbone_loss', 'sidechain_loss',
                           'tr_base_loss', 'rot_base_loss', 'tor_base_loss', 'backbone_base_loss', 'sidechain_base_loss'])
 
-    for data in tqdm(loader, total=len(loader)):
+    cnt = 0
+    print(len(loader))
+    for data in tqdm(loader, total=len(loader)): # TODO calculate time consumption
         if device.type == 'cuda' and len(data) == 1 or device.type == 'cpu' and data.num_graphs == 1:
             print("Skipping batch of size 1 since otherwise batchnorm would not work.")
             continue
         optimizer.zero_grad()
         data = [d.to(device) for d in data] if device.type == 'cuda' else data
         try:
+            start_time = time.time()
             tr_pred, rot_pred, tor_pred, sidechain_pred = model(data)
+            tqdm.write(f"Time for forward pass: {time.time() - start_time}")
+            start_time = time.time()
             loss_tuple = loss_fn(tr_pred, rot_pred, tor_pred, sidechain_pred, data=data, t_to_sigma=t_to_sigma, device=device)
+            tqdm.write(f"Time for loss calculation: {time.time() - start_time}")
             if loss_tuple is None:
                 print("None loss tuple, skipping")
                 continue
@@ -183,6 +190,10 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
             optimizer.step()
             if ema_weights is not None: ema_weights.update(model.parameters())
             meter.add([loss.cpu().detach(), *loss_tuple[1:]])
+            cnt = cnt + 1
+        
+            if debug_batch != 0 and cnt >= debug_batch:
+                break
             
         except RuntimeError as e:
             if 'out of memory' in str(e):
@@ -200,8 +211,8 @@ def train_epoch(model, loader, optimizer, device, t_to_sigma, loss_fn, ema_weigh
                 torch.cuda.empty_cache()
                 continue
             else:
-                #raise e
-                print(e)
+                raise e
+                # print(e)
                 continue
             
     return meter.summary()
