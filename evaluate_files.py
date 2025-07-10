@@ -13,6 +13,18 @@ from datasets.pdbbind import read_mol
 from datasets.process_mols import read_molecule
 from utils.utils import read_strings_from_txt, get_symmetry_rmsd
 
+def index2name(file,index):
+    with open(file, 'r') as f:
+        lines = f.readlines()
+    return lines[int(index)+1].split(',')[1].split('/')[-1].split('_protein')[0]
+
+def name2index(file,name):
+    with open(file, 'r') as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines):
+        if name in line:
+            return str(i-1)
+
 parser = ArgumentParser()
 parser.add_argument('--config', type=FileType(mode='r'), default=None)
 parser.add_argument('--data_dir', type=str, default='data/PDBBind_processed', help='')
@@ -31,6 +43,10 @@ print('Reading paths and names.')
 names = read_strings_from_txt(args.test_names_path)
 names_no_rec_overlap = read_strings_from_txt(args.no_overlap_names_path)
 results_path_containments = os.listdir(args.results_path)
+
+for i, directory in enumerate(results_path_containments):
+    if os.path.isdir(os.path.join(args.results_path, directory)):
+        results_path_containments[i] = index2name('/opt/data/private/diffdock-v1/DiffDock/test_dockgen.csv',directory)
 
 all_times = []
 successful_names_list = []
@@ -51,13 +67,16 @@ for i, name in enumerate(tqdm(names)):
             print('Did not find a directory for ', name, '. We are skipping that complex')
             continue
         else:
-            directory_with_name = directory_with_name_list[0]
+            directory_with_name = name2index('/opt/data/private/diffdock-v1/DiffDock/test_dockgen.csv',directory_with_name_list[0])
         ligand_pos = []
         debug_paths = []
+        file_paths = sorted(os.listdir(os.path.join(args.results_path, directory_with_name)))
+        if args.file_to_exclude is not None:
+            file_paths = [path for path in file_paths if not args.file_to_exclude in path]
+        if len(file_paths)<(args.num_predictions+1):
+            tqdm.write('Skipping complex because it has not enough predictions: ' + name)
+            continue
         for i in range(args.num_predictions):
-            file_paths = sorted(os.listdir(os.path.join(args.results_path, directory_with_name)))
-            if args.file_to_exclude is not None:
-                file_paths = [path for path in file_paths if not args.file_to_exclude in path]
             file_path = [path for path in file_paths if f'rank{i+1}_' in path][0]
             mol_pred = read_molecule(os.path.join(args.results_path, directory_with_name, file_path),remove_hs=True, sanitize=True)
             mol_pred = Chem.RemoveAllHs(mol_pred)
@@ -97,7 +116,7 @@ for i, name in enumerate(tqdm(names)):
     successful_names_list.append(name)
     without_rec_overlap_list.append(1 if name in names_no_rec_overlap else 0)
 performance_metrics = {}
-for overlap in ['', 'no_overlap_']:
+for overlap in ['']:
     if 'no_overlap_' == overlap:
         without_rec_overlap = np.array(without_rec_overlap_list, dtype=bool)
         rmsds = np.array(rmsds_list)[without_rec_overlap]

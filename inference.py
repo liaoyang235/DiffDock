@@ -25,7 +25,7 @@ parser.add_argument('--complex_name', type=str, default='1a0q', help='Name that 
 parser.add_argument('--protein_path', type=str, default=None, help='Path to the protein file')
 parser.add_argument('--protein_sequence', type=str, default=None, help='Sequence of the protein for ESMFold, this is ignored if --protein_path is not None')
 parser.add_argument('--ligand_description', type=str, default='CCCCC(NC(=O)CCC(=O)O)P(=O)(O)OC1=CC=CC=C1', help='Either a SMILES string or the path to a molecule file that rdkit can read')
-
+parser.add_argument('--precomputed_dir', type=str, default=None, help='Path to a precomputed ESM embeddings file. If this is not None, the embeddings will be used instead of computing them from the protein sequence. This should be a .npy file with shape (N, 1280) where N is the number of residues in the protein sequence')
 parser.add_argument('--out_dir', type=str, default='results/user_inference', help='Directory where the outputs will be written to')
 parser.add_argument('--save_visualisation', action='store_true', default=False, help='Save a pdb file with all of the steps of the reverse diffusion')
 parser.add_argument('--samples_per_complex', type=int, default=10, help='Number of samples to generate')
@@ -74,7 +74,8 @@ test_dataset = InferenceDataset(out_dir=args.out_dir, complex_names=complex_name
                                 receptor_radius=score_model_args.receptor_radius, remove_hs=score_model_args.remove_hs,
                                 c_alpha_max_neighbors=score_model_args.c_alpha_max_neighbors,
                                 all_atoms=score_model_args.all_atoms, atom_radius=score_model_args.atom_radius,
-                                atom_max_neighbors=score_model_args.atom_max_neighbors)
+                                atom_max_neighbors=score_model_args.atom_max_neighbors,
+                                precomputed_lm_embeddings=args.precomputed_dir)
 test_loader = DataLoader(dataset=test_dataset, batch_size=1, shuffle=False)
 
 if args.confidence_model_dir is not None and not confidence_args.use_original_model_cache:
@@ -88,7 +89,7 @@ if args.confidence_model_dir is not None and not confidence_args.use_original_mo
                          c_alpha_max_neighbors=confidence_args.c_alpha_max_neighbors,
                          all_atoms=confidence_args.all_atoms, atom_radius=confidence_args.atom_radius,
                          atom_max_neighbors=confidence_args.atom_max_neighbors,
-                         precomputed_lm_embeddings=test_dataset.lm_embeddings)
+                         precomputed_lm_embeddings=args.precomputed_dir)
 else:
     confidence_test_dataset = None
 
